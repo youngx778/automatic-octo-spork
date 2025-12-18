@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Immersive Gesture Particle System</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        :root { --accent: #00f2ff; }
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        
+        /* 响应式 UI 布局 */
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(10px);
+            padding: 20px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1);
+            color: white; z-index: 100; max-width: 250px;
+        }
+        
+        @media (max-width: 768px) {
+            #ui-panel { top: auto; bottom: 20px; left: 10px; right: 10px; max-width: none; }
+        }
+
+        .control-group { margin-bottom: 15px; }
+        label { display: block; font-size: 12px; margin-bottom: 5px; opacity: 0.8; }
+        input[type="range"] { width: 100%; accent-color: var(--accent); }
+        select, button { 
+            width: 100%; background: #333; border: none; color: white; 
+            padding: 8px; border-radius: 5px; cursor: pointer; margin-top: 5px;
+        }
+        
+        #video-preview {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 160px; height: 120px; border: 2px solid var(--accent);
+            border-radius: 8px; transform: scaleX(-1);
+        }
+        
+        #canvas-draw {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            border: 1px dashed var(--accent); display: none; cursor: crosshair;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui-panel">
+    <h3>粒子感应系统</h3>
+    <div class="control-group">
+        <label>预设形态</label>
+        <select id="preset">
+            <option value="nebula">星云 (Nebula)</option>
+            <option value="tesseract">四维模型 (Tesseract)</option>
+            <option value="custom">手绘自定义 (Draw)</option>
+        </select>
+    </div>
+    <div class="control-group">
+        <label>粒子密度</label>
+        <input type="range" id="density" min="1000" max="50000" value="15000">
+    </div>
+    <div class="control-group">
+        <label>扩散强度 (手势感应)</label>
+        <input type="range" id="dispersion" min="0.1" max="5" step="0.1" value="1.5">
+    </div>
+    <div class="control-group">
+        <label>粒子颜色</label>
+        <input type="color" id="colorPicker" value="#00f2ff" style="width:100%">
+    </div>
+    <button id="drawBtn">开始手绘</button>
+</div>
+
+<video id="video-preview"></video>
+<canvas id="canvas-draw" width="500" height="500"></button>
+
+<script id="vertexShader" type="x-shader/x-vertex">
+    varying vec2 vUv;
+    uniform float uTime;
+    uniform vec3 uHandPos;
+    uniform float uSpread;
+    uniform float uIsPinching; // 0=张开, 1=合拢
+
+    void main() {
+        vUv = uv;
+        vec3 pos = position;
+        
+        // 核心逻辑：计算点到手部的距离
+        float dist = distance(pos, uHandPos);
+        
+        // 手部张合控制扩散/聚合
+        float force = (1.0 - uIsPinching) * uSpread / (dist + 0.5);
+        pos += normalize(pos - uHandPos) * force;
+        
+        // 基础动态摆动
+        pos.x += sin(uTime + pos.z) * 0.1;
+        
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_PointSize = (20.0 / -mvPosition.z);
+        gl_Position = projectionMatrix * mvPosition;
+    }
+</script>
+
+<script id="fragmentShader" type="x-shader/x-fragment">
+    uniform vec3 uColor;
+    void main() {
+        float r = distance(gl_PointCoord, vec2(0.5));
+        if (r > 0.5) discard; // 圆形粒子
+        float alpha = 1.0 - pow(r*2.0, 2.0);
+        gl_FragColor = vec4(uColor, alpha);
+    }
+</script>
+
+<script>
+/** * 系统核心：整合 MediaPipe 与 Three.js 
+ */
+let scene, camera, renderer, particles, material;
+let videoElement, hands;
+let handData = { x: 0, y: 0, z: 0, isPinching: 0 };
+let drawingPoints = [];
+
+// 1. 初始化 Three.js 场景
+function initThree() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 5;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // 背景深空粒子
+    const bgGeo = new THREE.BufferGeometry();
+    const bgCoords = [];
+    for(let i=0; i<2000; i++) bgCoords.push((Math.random()-0.5)*50, (Math.random()-0.5)*50, (Math.random()-0.5)*50);
+    bgGeo.setAttribute('position', new THREE.Float32BufferAttribute(bgCoords, 3));
+    const bgMat = new THREE.PointsMaterial({ color: 0x444444, size: 0.05 });
+    scene.add(new THREE.Points(bgGeo, bgMat));
+
+    // 主粒子系统
+    createParticles('nebula');
+    animate();
+}
+
+function createParticles(type) {
+    if (particles) scene.remove(particles);
+    
+    const count = parseInt(document.getElementById('density').value);
+    const geo = new THREE.BufferGeometry();
+    const positions = [];
+    
+    for (let i = 0; i < count; i++) {
+        if (type === 'nebula') {
+            const r = Math.random() * 3;
+            const theta = Math.random() * Math.PI * 2;
+            positions.push(Math.cos(theta)*r, Math.sin(theta)*r, (Math.random()-0.5)*2);
+        } else if (type === 'tesseract') {
+            positions.push((Math.random()-0.5)*4, (Math.random()-0.5)*4, (Math.random()-0.5)*4);
+        }
+    }
+
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    
+    material = new THREE.ShaderMaterial({
+        uniforms: {
+            uTime: { value: 0 },
+            uHandPos: { value: new THREE.Vector3() },
+            uSpread: { value: 1.5 },
+            uIsPinching: { value: 0 },
+            uColor: { value: new THREE.Color(document.getElementById('colorPicker').value) }
+        },
+        vertexShader: document.getElementById('vertexShader').textContent,
+        fragmentShader: document.getElementById('fragmentShader').textContent,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+    });
+
+    particles = new THREE.Points(geo, material);
+    scene.add(particles);
+}
+
+// 2. MediaPipe 手势识别
+async function initMediaPipe() {
+    videoElement = document.getElementById('video-preview');
+    hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(results => {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const lm = results.multiHandLandmarks[0];
+            // 归一化坐标转换到 3D 空间
+            handData.x = (lm[9].x - 0.5) * 10;
+            handData.y = -(lm[9].y - 0.5) * 10;
+            
+            // 计算食指和拇指距离判断“张合”
+            const dist = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
+            handData.isPinching = dist < 0.08 ? 1.0 : 0.0;
+        }
+    });
+
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 640, height: 480
+    });
+    cameraUtils.start();
+}
+
+// 3. 手绘逻辑
+const drawCanvas = document.getElementById('canvas-draw');
+const ctx = drawCanvas.getContext('2d');
+let isDrawing = false;
+
+document.getElementById('drawBtn').onclick = () => {
+    drawCanvas.style.display = 'block';
+    ctx.clearRect(0,0,500,500);
+    drawingPoints = [];
+};
+
+drawCanvas.onmousedown = () => isDrawing = true;
+drawCanvas.onmouseup = () => {
+    isDrawing = false;
+    drawCanvas.style.display = 'none';
+    generateCustomParticles();
+};
+drawCanvas.onmousemove = (e) => {
+    if(!isDrawing) return;
+    const rect = drawCanvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    drawingPoints.push({x: (x/500-0.5)*8, y: -(y/500-0.5)*8});
+    ctx.fillStyle = "cyan";
+    ctx.fillRect(x,y,4,4);
+};
+
+function generateCustomParticles() {
+    if(drawingPoints.length < 10) return;
+    const count = parseInt(document.getElementById('density').value);
+    const positions = [];
+    for(let i=0; i<count; i++) {
+        const pt = drawingPoints[Math.floor(Math.random()*drawingPoints.length)];
+        positions.push(pt.x + (Math.random()-0.5)*0.2, pt.y + (Math.random()-0.5)*0.2, (Math.random()-0.5)*0.5);
+    }
+    particles.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+}
+
+// 4. 动画循环
+function animate() {
+    requestAnimationFrame(animate);
+    
+    if(material) {
+        material.uniforms.uTime.value += 0.01;
+        // 平滑同步手部坐标
+        material.uniforms.uHandPos.value.lerp(new THREE.Vector3(handData.x, handData.y, 0), 0.1);
+        material.uniforms.uIsPinching.value = handData.isPinching;
+        material.uniforms.uSpread.value = document.getElementById('dispersion').value;
+        material.uniforms.uColor.value.set(document.getElementById('colorPicker').value);
+    }
+
+    renderer.render(scene, camera);
+}
+
+// 5. 交互事件
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+document.getElementById('preset').onchange = (e) => createParticles(e.target.value);
+document.getElementById('density').oninput = () => createParticles(document.getElementById('preset').value);
+
+// 启动
+initThree();
+initMediaPipe();
+
+</script>
+</body>
+</html>
